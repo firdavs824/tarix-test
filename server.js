@@ -1,6 +1,6 @@
 /**
- * TARIX TEST — SERVER (Node.js, tashqi paketlarsiz)
- * Ishga tushirish: node server.js  (PORT, HOST, ADMIN_PASSWORD env orqali ixtiyoriy)
+ * TARIX TEST — SERVER (Node.js, tashqi paketlarsiz, Upstash Redis + JSON fallback)
+ * Ishga tushirish: node server.js (PORT, HOST, ADMIN_PASSWORD, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
  */
 const http = require('http');
 const fs = require('fs');
@@ -14,6 +14,20 @@ const DATA_DIR = path.join(__dirname, 'data');
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '');
+const REDIS_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+const USE_REDIS = Boolean(REDIS_URL && REDIS_TOKEN);
+
+const REDIS_PREFIX = 'tarix_test:v1:';
+const KEYS = {
+  users: REDIS_PREFIX + 'users',
+  questions: REDIS_PREFIX + 'questions',
+  sessions: REDIS_PREFIX + 'sessions',
+  materials: REDIS_PREFIX + 'materials',
+  submissions: REDIS_PREFIX + 'submissions',
+  admin: REDIS_PREFIX + 'admin',
+};
 
 const FILES = {
   users: path.join(DATA_DIR, 'users.json'),
@@ -31,28 +45,13 @@ const LEVELS = {
   qiyin: { label: 'Qiyin', seconds: 10, xp: 30 },
 };
 const TEST_SIZE = { topic: 6, certificate: 10 };
-const GRACE_MS = 3000;            // tarmoq kechikishi uchun qo'shimcha vaqt
+const GRACE_MS = 3000;
 const SESSION_TTL = 30 * 24 * 3600 * 1000;
 const ADMIN_TTL = 8 * 3600 * 1000;
 const MAX_BODY = 1024 * 1024;
 const NAME_RE = /^[\p{L}\p{N}ʼ’' .-]{3,40}$/u;
 
-// ---------- Fayl yordamchilari ----------
-function load(file, fallback) {
-  try {
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    console.error(`O'qishda xatolik (${path.basename(file)}):`, e.message);
-  }
-  return structuredClone(fallback);
-}
-function save(file, data) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, file); // atomik yozish
-}
-
-// Birinchi ishga tushirishda namunaviy savollar (faqat questions.json yo'q bo'lsa)
+// Birinchi ishga tushirishda namunaviy savollar (faqat bazada savollar yo'q bo'lsa)
 const SEED_QUESTIONS = [
   { id: 'uz_q1', type: 'topic', level: 'qiyin', category: 'Amir Temur Saltanati', question: "1402-yil 20-iyuldagi Anqara jangida Amir Temur qaysi Usmonli sultonini asirga olgan?", options: ['Sulton Murod I', 'Sulton Boyazid I Yildirim', 'Sulton Mehmed II Fotih', 'Sulton Sulaymon Qonuniy'], correct: 1, image: '', explanation: "Anqara jangida Boyazid Yildirim yengilgan va asirga olingan." },
   { id: 'uz_q2', type: 'topic', level: 'qiyin', category: "Qadimgi O'zbekiston", question: "Miloddan avvalgi 530-yilda massagetlar malikasi To'maris qaysi shohni mag'lub etgan?", options: ['Doro I', 'Kserks I', 'Kir II (Kavush)', 'Kambiz II'], correct: 2, image: '', explanation: "Kir II O'rta Osiyoga bosqini vaqtida massagetlar tomonidan o'ldirilgan." },
@@ -67,50 +66,62 @@ const SEED_QUESTIONS = [
   { id: 'uz_cert3', type: 'certificate', level: 'oson', category: 'Milliy Sertifikat', question: "Amir Temur qo'shinida 10 000 kishilik qism boshlig'i qanday unvon bilan atalgan?", options: ['Amirul-umaro (Amiri tuman)', 'Yuzboshi', 'Mingboshi', 'Tavochi'], correct: 0, image: '', explanation: "10 000 kishilik qism tuman deb atalgan va unga amir rahbarlik qilgan." },
 ];
 
-// ---------- Xotira ----------
-const db = {
-  users: load(FILES.users, []),
-  questions: fs.existsSync(FILES.questions) ? load(FILES.questions, []) : structuredClone(SEED_QUESTIONS),
-  sessions: load(FILES.sessions, {}),
-  materials: load(FILES.materials, { videos: [], books: [] }),
-  submissions: load(FILES.submissions, []),
-};
-// Eski (seed / parolsiz) akkauntlarni olib tashlash
-db.users = db.users.filter(u => u.salt && u.passHash && u.nameKey);
-const liveUserIds = new Set(db.users.map(u => u.id));
-db.submissions = db.submissions.filter(s => liveUserIds.has(s.userId));
-db.questions = db.questions.map(q => ({
-  ...q,
-  type: q.type === 'certificate' ? 'certificate' : 'topic',
-  level: LEVELS[q.level] ? q.level : 'orta',
-  category: q.category || "O'zbekiston tarixi",
-}));
-
-const saveUsers = () => save(FILES.users, db.users);
-const saveSessions = () => save(FILES.sessions, db.sessions);
-const saveQuestions = () => save(FILES.questions, db.questions);
-const saveMaterials = () => save(FILES.materials, db.materials);
-const saveSubmissions = () => save(FILES.submissions, db.submissions);
-if (!fs.existsSync(FILES.questions)) saveQuestions();
-
-// Ustoz paroli (birinchi ishga tushirishda yaratiladi)
-let adminCfg = load(FILES.admin, null);
-if (!adminCfg) {
-  const initial = process.env.ADMIN_PASSWORD || crypto.randomBytes(6).toString('base64url');
-  adminCfg = hashPassword(initial);
-  save(FILES.admin, adminCfg);
-  console.log(`\n⚠️  Ustoz paroli yaratildi: ${initial}\n   Uni darhol admin paneldan o'zgartiring.\n`);
+// ---------- Upstash Redis REST mijoz ----------
+async function redisCmd(...args) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(REDIS_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${REDIS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(args),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`Upstash HTTP ${res.status}: ${txt}`);
+    }
+    const json = await res.json();
+    if (json.error) throw new Error(`Upstash error: ${json.error}`);
+    return json.result;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-const tests = new Map();          // faol testlar (xotirada)
-const adminTokens = new Map();    // token -> muddati
-const attempts = new Map();       // rate limit
+async function redisGetJson(key, fallback) {
+  const raw = await redisCmd('GET', key);
+  if (raw === null || raw === undefined) return { exists: false, value: structuredClone(fallback) };
+  if (typeof raw === 'object') return { exists: true, value: raw };
+  try {
+    return { exists: true, value: JSON.parse(String(raw)) };
+  } catch (e) {
+    console.error(`Redis JSON parse xatolik (${key}):`, e.message);
+    return { exists: true, value: structuredClone(fallback) };
+  }
+}
 
-setInterval(() => {
-  const cutoff = Date.now() - 3 * 3600e3;
-  for (const [id, t] of tests) if (t.createdAt < cutoff) tests.delete(id);
-  for (const [t, exp] of adminTokens) if (exp < Date.now()) adminTokens.delete(t);
-}, 10 * 60e3).unref();
+async function redisSetJson(key, value) {
+  await redisCmd('SET', key, JSON.stringify(value));
+}
+
+// ---------- Lokal fayl yordamchilari (faqat Redis yo'q bo'lsa) ----------
+function loadFile(file, fallback) {
+  try {
+    if (fs.existsSync(file)) return { exists: true, value: JSON.parse(fs.readFileSync(file, 'utf8')) };
+  } catch (e) {
+    console.error(`O'qishda xatolik (${path.basename(file)}):`, e.message);
+  }
+  return { exists: false, value: structuredClone(fallback) };
+}
+function saveFile(file, data) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
 
 // ---------- Umumiy yordamchilar ----------
 class HttpError extends Error {
@@ -123,7 +134,7 @@ const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}
 const monthKey = (d = new Date()) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
 function weekKey(d = new Date()) {
   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); // dushanba
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
   return dayKey(x);
 }
 
@@ -132,20 +143,21 @@ const isHttp = u => { try { const x = new URL(u); return x.protocol === 'http:' 
 const tokenHash = t => crypto.createHash('sha256').update(t).digest('hex');
 const bearer = req => (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
 
+function scryptHex(pw, salt) {
+  return crypto.scryptSync(String(pw), salt, 64).toString('hex');
+}
 function hashPassword(pw) {
   const salt = crypto.randomBytes(16).toString('hex');
   return { salt, hash: scryptHex(pw, salt) };
 }
-function scryptHex(pw, salt) {
-  return crypto.scryptSync(String(pw), salt, 64).toString('hex');
-}
 function verifyPassword(pw, salt, hash) {
+  if (!salt || !hash) return false;
   const a = Buffer.from(scryptHex(pw, salt), 'hex');
   const b = Buffer.from(hash, 'hex');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 function tempPassword(n = 8) {
-  const cs = 'abcdefghjkmnpqrstuvwxyz23456789'; // chalkashtiradigan belgilarsiz
+  const cs = 'abcdefghjkmnpqrstuvwxyz23456789';
   let s = '';
   for (let i = 0; i < n; i++) s += cs[crypto.randomInt(cs.length)];
   return s;
@@ -159,6 +171,7 @@ function shuffle(arr) {
   return a;
 }
 
+const attempts = new Map();
 function rateLimit(key, max = 10, windowMs = 15 * 60e3) {
   const now = Date.now();
   const rec = attempts.get(key) || { n: 0, start: now };
@@ -191,20 +204,110 @@ function readBody(req) {
   });
 }
 
+// ---------- Ma'lumotlar qatlami (Upstash Redis + JSON fallback) ----------
+const db = {
+  users: [],
+  questions: [],
+  sessions: {},
+  materials: { videos: [], books: [] },
+  submissions: [],
+};
+let adminCfg = null;
+
+async function readStore(name, fallback) {
+  return USE_REDIS ? redisGetJson(KEYS[name], fallback) : loadFile(FILES[name], fallback);
+}
+async function writeStore(name, data) {
+  if (USE_REDIS) await redisSetJson(KEYS[name], data);
+  else saveFile(FILES[name], data);
+}
+
+const saveUsers = () => writeStore('users', db.users);
+const saveSessions = () => writeStore('sessions', db.sessions);
+const saveQuestions = () => writeStore('questions', db.questions);
+const saveMaterials = () => writeStore('materials', db.materials);
+const saveSubmissions = () => writeStore('submissions', db.submissions);
+const saveAdmin = () => writeStore('admin', adminCfg);
+
+async function initStorage() {
+  const [uRes, qRes, sRes, mRes, subRes, aRes] = await Promise.all([
+    readStore('users', []),
+    readStore('questions', SEED_QUESTIONS),
+    readStore('sessions', {}),
+    readStore('materials', { videos: [], books: [] }),
+    readStore('submissions', []),
+    readStore('admin', null),
+  ]);
+
+  db.users = Array.isArray(uRes.value)
+    ? uRes.value.filter(u => u && u.salt && u.passHash && u.nameKey)
+    : [];
+
+  db.questions = (qRes.exists && Array.isArray(qRes.value) ? qRes.value : structuredClone(SEED_QUESTIONS)).map(q => ({
+    ...q,
+    type: q.type === 'certificate' ? 'certificate' : 'topic',
+    level: LEVELS[q.level] ? q.level : 'orta',
+    category: q.category || "O'zbekiston tarixi",
+  }));
+
+  db.sessions = sRes.value && typeof sRes.value === 'object' ? sRes.value : {};
+  db.materials = mRes.value && typeof mRes.value === 'object'
+    ? { videos: Array.isArray(mRes.value.videos) ? mRes.value.videos : [], books: Array.isArray(mRes.value.books) ? mRes.value.books : [] }
+    : { videos: [], books: [] };
+
+  const liveUserIds = new Set(db.users.map(u => u.id));
+  db.submissions = Array.isArray(subRes.value)
+    ? subRes.value.filter(s => s && liveUserIds.has(s.userId))
+    : [];
+
+  if (!qRes.exists) await saveQuestions();
+  if (!mRes.exists) await saveMaterials();
+
+  if (aRes.exists && aRes.value && aRes.value.salt && aRes.value.hash) {
+    adminCfg = aRes.value;
+    if (process.env.ADMIN_PASSWORD) {
+      adminCfg = hashPassword(process.env.ADMIN_PASSWORD);
+      await saveAdmin();
+    }
+  } else {
+    const initial = process.env.ADMIN_PASSWORD || crypto.randomBytes(6).toString('base64url');
+    adminCfg = hashPassword(initial);
+    await saveAdmin();
+    if (!process.env.ADMIN_PASSWORD) {
+      console.log(`\n⚠️  Ustoz paroli yaratildi: ${initial}\n   Uni darhol admin paneldan o'zgartiring.\n`);
+    }
+  }
+
+  console.log(`🗄️  Baza rejimi: ${USE_REDIS ? 'Upstash Redis (' + REDIS_URL + ')' : 'Lokal JSON (data/*.json)'}`);
+}
+
+const tests = new Map();
+const adminTokens = new Map();
+
+setInterval(() => {
+  const cutoff = Date.now() - 3 * 3600e3;
+  for (const [id, t] of tests) if (t.createdAt < cutoff) tests.delete(id);
+  for (const [t, exp] of adminTokens) if (exp < Date.now()) adminTokens.delete(t);
+}, 10 * 60e3).unref();
+
 // ---------- Auth ----------
-function currentUser(req) {
+async function currentUser(req) {
   const t = bearer(req);
   if (!t) return null;
   const h = tokenHash(t);
   const s = db.sessions[h];
   if (!s) return null;
-  if (s.exp < Date.now()) { delete db.sessions[h]; saveSessions(); return null; }
+  if (s.exp < Date.now()) {
+    delete db.sessions[h];
+    await saveSessions();
+    return null;
+  }
   return db.users.find(u => u.id === s.userId) || null;
 }
-function createSession(userId) {
+async function createSession(userId) {
   const token = crypto.randomBytes(32).toString('hex');
   db.sessions[tokenHash(token)] = { userId, exp: Date.now() + SESSION_TTL };
-  saveSessions();
+  await saveSessions();
   return token;
 }
 function isAdmin(req) {
@@ -229,8 +332,10 @@ function publicUser(u) {
 }
 function rollPeriods(u) {
   const wk = weekKey(), mk = monthKey();
-  if (u.weekKey !== wk) { u.weekKey = wk; u.weeklyXp = 0; }
-  if (u.monthKey !== mk) { u.monthKey = mk; u.monthlyXp = 0; }
+  let changed = false;
+  if (u.weekKey !== wk) { u.weekKey = wk; u.weeklyXp = 0; changed = true; }
+  if (u.monthKey !== mk) { u.monthKey = mk; u.monthlyXp = 0; changed = true; }
+  return changed;
 }
 function updateStreak(u) {
   const today = dayKey();
@@ -259,11 +364,10 @@ function getOwnTest(id, u) {
   if (t.finished) throw httpError(400, "Test allaqachon yakunlangan");
   return t;
 }
-function finalize(t, u, cheated) {
+async function finalize(t, u, cheated) {
   t.finished = true;
   tests.delete(t.id);
 
-  // Javobsiz qolgan savollar vaqt tugagan deb hisoblanadi
   const answered = new Set(t.answers.map(a => a.questionId));
   for (const qid of t.questionIds) {
     if (answered.has(qid)) continue;
@@ -299,13 +403,13 @@ function finalize(t, u, cheated) {
     details,
   };
   db.submissions.unshift(sub);
-  saveSubmissions();
+  await saveSubmissions();
 
   rollPeriods(u);
   if (!cheated) { u.weeklyXp += xp; u.monthlyXp += xp; }
   u.testsCount += 1;
   updateStreak(u);
-  saveUsers();
+  await saveUsers();
   return { sub, xp };
 }
 
@@ -373,7 +477,7 @@ function cleanMaterial(kind, b, prev) {
 async function handleApi(req, res, url) {
   const p = url.pathname;
   const m = req.method;
-  const ip = req.socket.remoteAddress || 'ip';
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'ip';
   const sp = url.searchParams;
   const send = (code, data) => sendJSON(res, code, data);
 
@@ -396,8 +500,8 @@ async function handleApi(req, res, url) {
       mustChangePassword: false, createdAt: new Date().toISOString(),
     };
     db.users.push(user);
-    saveUsers();
-    const token = createSession(user.id);
+    await saveUsers();
+    const token = await createSession(user.id);
     return send(201, { success: true, token, user: publicUser(user) });
   }
 
@@ -407,26 +511,26 @@ async function handleApi(req, res, url) {
     const key = cleanStr(b.name, 40).replace(/\s+/g, ' ').toLowerCase();
     const pw = String(b.password ?? '');
     const u = db.users.find(x => x.nameKey === key);
-    if (!u) scryptHex(pw, '00000000000000000000000000000000'); // vaqt farqini yashirish
+    if (!u) scryptHex(pw, '00000000000000000000000000000000');
     if (!u || !verifyPassword(pw, u.salt, u.passHash)) throw httpError(401, "Ism yoki parol noto'g'ri");
-    const token = createSession(u.id);
+    const token = await createSession(u.id);
     return send(200, { success: true, token, user: publicUser(u) });
   }
 
   if (m === 'POST' && p === '/api/auth/logout') {
     const t = bearer(req);
-    if (t) { delete db.sessions[tokenHash(t)]; saveSessions(); }
+    if (t) { delete db.sessions[tokenHash(t)]; await saveSessions(); }
     return send(200, { success: true });
   }
 
   if (m === 'GET' && p === '/api/auth/me') {
-    const u = currentUser(req);
+    const u = await currentUser(req);
     if (!u) throw httpError(401, 'Avtorizatsiya muddati tugagan');
     return send(200, { success: true, user: publicUser(u) });
   }
 
   if (m === 'POST' && p === '/api/auth/change-password') {
-    const u = currentUser(req);
+    const u = await currentUser(req);
     if (!u) throw httpError(401, "Avval tizimga kiring");
     const b = await readBody(req);
     if (!verifyPassword(String(b.oldPassword ?? ''), u.salt, u.passHash)) throw httpError(400, "Eski parol noto'g'ri");
@@ -434,7 +538,7 @@ async function handleApi(req, res, url) {
     if (np.length < 6 || np.length > 128) throw httpError(400, "Yangi parol 6–128 belgidan iborat bo'lsin");
     const { salt, hash } = hashPassword(np);
     u.salt = salt; u.passHash = hash; u.mustChangePassword = false;
-    saveUsers();
+    await saveUsers();
     return send(200, { success: true });
   }
 
@@ -442,8 +546,9 @@ async function handleApi(req, res, url) {
   if (m === 'GET' && p === '/api/leaderboard') {
     const period = sp.get('period') === 'monthly' ? 'monthly' : 'weekly';
     const field = period === 'monthly' ? 'monthlyXp' : 'weeklyXp';
-    db.users.forEach(rollPeriods);
-    saveUsers();
+    let changed = false;
+    for (const u of db.users) if (rollPeriods(u)) changed = true;
+    if (changed) await saveUsers();
     const list = db.users
       .slice()
       .sort((a, b) => b[field] - a[field] || a.name.localeCompare(b.name))
@@ -457,7 +562,7 @@ async function handleApi(req, res, url) {
   }
 
   if (m === 'POST' && p === '/api/tests/start') {
-    const u = currentUser(req);
+    const u = await currentUser(req);
     if (!u) throw httpError(401, "Test yechish uchun tizimga kiring");
     const b = await readBody(req);
     const level = LEVELS[b.level] ? b.level : null;
@@ -492,7 +597,7 @@ async function handleApi(req, res, url) {
   }
 
   if (m === 'POST' && p === '/api/tests/answer') {
-    const u = currentUser(req);
+    const u = await currentUser(req);
     if (!u) throw httpError(401, "Tizimga kiring");
     const b = await readBody(req);
     const t = getOwnTest(b.testId, u);
@@ -515,22 +620,22 @@ async function handleApi(req, res, url) {
       success: true, isCorrect, timedOut,
       correctIndex: q.correct, explanation: q.explanation || '', done,
     };
-    if (done) resp.submission = finalize(t, u, false).sub;
+    if (done) resp.submission = (await finalize(t, u, false)).sub;
     else resp.next = publicQuestion(t);
     return send(200, resp);
   }
 
   if (m === 'POST' && p === '/api/tests/finish') {
-    const u = currentUser(req);
+    const u = await currentUser(req);
     if (!u) throw httpError(401, "Tizimga kiring");
     const b = await readBody(req);
     const t = getOwnTest(b.testId, u);
-    const { sub } = finalize(t, u, Boolean(b.cheated));
+    const { sub } = await finalize(t, u, Boolean(b.cheated));
     return send(200, { success: true, submission: sub });
   }
 
   if (m === 'GET' && p === '/api/user/history') {
-    const u = currentUser(req);
+    const u = await currentUser(req);
     if (!u) throw httpError(401, "Tizimga kiring");
     const list = db.submissions.filter(s => s.userId === u.id).slice(0, 300);
     return send(200, { success: true, history: list });
@@ -542,16 +647,15 @@ async function handleApi(req, res, url) {
   }
 
   // ===== 5. USTOZ =====
-  if (p.startsWith('/api/admin/')) return handleAdmin(req, res, url);
+  if (p.startsWith('/api/admin/')) return handleAdmin(req, res, url, ip);
 
   throw httpError(404, 'Topilmadi');
 }
 
-async function handleAdmin(req, res, url) {
+async function handleAdmin(req, res, url, ip) {
   const p = url.pathname;
   const m = req.method;
   const send = (code, data) => sendJSON(res, code, data);
-  const ip = req.socket.remoteAddress || 'ip';
 
   if (m === 'POST' && p === '/api/admin/login') {
     rateLimit(`admin:${ip}`, 8);
@@ -571,17 +675,16 @@ async function handleAdmin(req, res, url) {
     const np = String(b.newPassword ?? '');
     if (np.length < 6 || np.length > 128) throw httpError(400, "Yangi parol 6–128 belgidan iborat bo'lsin");
     adminCfg = hashPassword(np);
-    save(FILES.admin, adminCfg);
+    await saveAdmin();
     adminTokens.clear();
     return send(200, { success: true, message: "Ustoz paroli yangilandi. Qayta kiring." });
   }
 
   if (m === 'GET' && p === '/api/admin/info') {
     const ip4 = getLocalIP();
-    return send(200, { success: true, localIP: ip4, mobileUrl: `http://${ip4}:${PORT}` });
+    return send(200, { success: true, localIP: ip4, mobileUrl: `http://${ip4}:${PORT}`, storage: USE_REDIS ? 'upstash' : 'file' });
   }
 
-  // O'quvchilar
   if (m === 'GET' && p === '/api/admin/users') {
     const list = db.users
       .slice()
@@ -598,7 +701,8 @@ async function handleAdmin(req, res, url) {
     const { salt, hash } = hashPassword(temp);
     u.salt = salt; u.passHash = hash; u.mustChangePassword = true;
     for (const k of Object.keys(db.sessions)) if (db.sessions[k].userId === u.id) delete db.sessions[k];
-    saveUsers(); saveSessions();
+    await saveUsers();
+    await saveSessions();
     return send(200, { success: true, name: u.name, tempPassword: temp });
   }
 
@@ -610,17 +714,17 @@ async function handleAdmin(req, res, url) {
     if (db.users.length === before) throw httpError(404, "O'quvchi topilmadi");
     for (const k of Object.keys(db.sessions)) if (db.sessions[k].userId === id) delete db.sessions[k];
     db.submissions = db.submissions.filter(s => s.userId !== id);
-    saveUsers(); saveSessions(); saveSubmissions();
+    await saveUsers();
+    await saveSessions();
+    await saveSubmissions();
     return send(200, { success: true });
   }
 
-  // Natijalar (monitoring)
   if (m === 'GET' && p === '/api/admin/submissions') {
     const list = db.submissions.slice(0, 500).map(({ details, ...rest }) => rest);
     return send(200, { success: true, submissions: list });
   }
 
-  // Savollar
   if (m === 'GET' && p === '/api/admin/questions') {
     return send(200, { success: true, questions: db.questions });
   }
@@ -628,7 +732,7 @@ async function handleAdmin(req, res, url) {
     const b = await readBody(req);
     const item = { id: 'q_' + crypto.randomBytes(8).toString('hex'), ...cleanQuestion(b, null) };
     db.questions.unshift(item);
-    saveQuestions();
+    await saveQuestions();
     return send(201, { success: true, question: item });
   }
   const qMatch = p.match(/^\/api\/admin\/questions\/(q_[a-f0-9]+|uz_[A-Za-z0-9_]+)$/);
@@ -637,16 +741,15 @@ async function handleAdmin(req, res, url) {
     if (idx < 0) throw httpError(404, 'Savol topilmadi');
     if (m === 'DELETE') {
       db.questions.splice(idx, 1);
-      saveQuestions();
+      await saveQuestions();
       return send(200, { success: true });
     }
     const b = await readBody(req);
     db.questions[idx] = { ...db.questions[idx], ...cleanQuestion(b, db.questions[idx]) };
-    saveQuestions();
+    await saveQuestions();
     return send(200, { success: true, question: db.questions[idx] });
   }
 
-  // Materiallar
   if (m === 'POST' && p === '/api/admin/materials') {
     const b = await readBody(req);
     const kind = b.kind === 'video' ? 'video' : b.kind === 'book' ? 'book' : null;
@@ -656,7 +759,7 @@ async function handleAdmin(req, res, url) {
       kind, ...cleanMaterial(kind, b, null),
     };
     (kind === 'video' ? db.materials.videos : db.materials.books).unshift(item);
-    saveMaterials();
+    await saveMaterials();
     return send(201, { success: true, item });
   }
   const matMatch = p.match(/^\/api\/admin\/materials\/([vb]_[a-f0-9]+)$/);
@@ -669,13 +772,13 @@ async function handleAdmin(req, res, url) {
     const idx = vi >= 0 ? vi : bi;
     if (m === 'DELETE') {
       list.splice(idx, 1);
-      saveMaterials();
+      await saveMaterials();
       return send(200, { success: true });
     }
     const b = await readBody(req);
     const kind = vi >= 0 ? 'video' : 'book';
     list[idx] = { ...list[idx], ...cleanMaterial(kind, b, list[idx]) };
-    saveMaterials();
+    await saveMaterials();
     return send(200, { success: true, item: list[idx] });
   }
 
@@ -716,7 +819,6 @@ function serveStatic(req, res, pathname) {
   });
 }
 
-// ---------- Server ----------
 function getLocalIP() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
@@ -742,12 +844,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  const ip = getLocalIP();
-  console.log('\n=======================================================');
-  console.log('   🏛️  TARIX TEST — SERVER ISHGA TUSHDI');
-  console.log('=======================================================');
-  console.log(`💻 Kompyuterda:  http://localhost:${PORT}`);
-  console.log(`📱 Telefonda:    http://${ip}:${PORT}`);
-  console.log('=======================================================\n');
-});
+initStorage()
+  .then(() => {
+    server.listen(PORT, HOST, () => {
+      const ip = getLocalIP();
+      console.log('\n=======================================================');
+      console.log('   🏛️  TARIX TEST — SERVER ISHGA TUSHDI');
+      console.log('=======================================================');
+      console.log(`💻 Kompyuterda:  http://localhost:${PORT}`);
+      console.log(`📱 Telefonda:    http://${ip}:${PORT}`);
+      console.log('=======================================================\n');
+    });
+  })
+  .catch(err => {
+    console.error("Bazani ishga tushirishda xatolik:", err);
+    process.exit(1);
+  });
